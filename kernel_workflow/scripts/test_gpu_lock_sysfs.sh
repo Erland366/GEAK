@@ -66,6 +66,18 @@ expect "$(run ROCR_VISIBLE_DEVICES=GPU-a2933f290499b2eb -- _gpu_is_idle 0)" 2 "U
 expect "$(run -- _gpu_is_idle 5)" 2 "GPU id without a KFD node"
 expect "$(run -- _gpu_is_idle x)" 2 "non-numeric GPU id"
 
+lockfile() {  # lockfile <ROCR mask or ""> <id>
+  env -u ROCR_VISIBLE_DEVICES ${1:+ROCR_VISIBLE_DEVICES=$1} GEAK_SYSFS_ROOT="$root" bash -c '
+    eval "$(sed -n "/^LOCK_DIR=/p; /^GEAK_SYSFS_ROOT=/p; /^_gpu_sysfs_dev()/,/^}/p; /^_gpu_lock_file()/,/^}/p" "'"$LOCK"'")"
+    _gpu_lock_file "$0"' "$2"
+}
+[ "$(lockfile "" 1)" = "/tmp/team_gpu_locks/gpu_0000:4a:00.0.lock" ] || fail "lock file must be named by PCI address"
+[ "$(lockfile 1 0)" = "$(lockfile "" 1)" ] || fail "one physical GPU must get one lock file under any ROCR mask"
+[ "$(lockfile "" 0)" != "$(lockfile 1 0)" ] || fail "different physical GPUs must not share a lock file"
+lockfile GPU-a2933f290499b2eb 0 >/dev/null 2>&1 && fail "an unmappable GPU must not get a lock file"
+[ "$(GEAK_GPU_REQUIRE_IDLE=0 lockfile "" 9876 2>/dev/null)" = "/tmp/team_gpu_locks/gpu_unmapped_9876.lock" ] \
+  || fail "an explicit inspection opt-out may lock an unmappable id under the unmapped name only"
+
 rm "$root/devices/0000:47:00.0/gpu_busy_percent"
 expect "$(run -- _gpu_is_idle 0)" 2 "missing busy telemetry is unknown, not idle"
 echo 0 > "$root/devices/0000:47:00.0/gpu_busy_percent"

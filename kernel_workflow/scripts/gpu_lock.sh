@@ -159,6 +159,24 @@ _gpu_is_idle() {
     [ "$busy" -le "${GEAK_GPU_MAX_BUSY_PCT:-5}" ] && [ "$(( vram / 1048576 ))" -le "${GEAK_GPU_MAX_VRAM_MB:-1024}" ]
 }
 
+# Lock files are named by the GPU's PCI address, not its id: an id is relative to the caller's
+# ROCR_VISIBLE_DEVICES (a container limited to physical GPU 1 calls it GPU 0), so id-named locks let two
+# runs on one GPU take different locks and two runs on different GPUs take the same one.
+# A caller that opted out of inspection (GEAK_GPU_REQUIRE_IDLE=0) may lock an unmappable id, under a separate
+# gpu_unmapped_<id> name that never aliases a PCI-named lock, and is told that ownership is not proven.
+_gpu_lock_file() {
+    local dev
+    if dev="$(_gpu_sysfs_dev "$1")"; then
+        echo "${LOCK_DIR}/gpu_${dev##*/}.lock"
+    elif [ "${GEAK_GPU_REQUIRE_IDLE:-1}" = "0" ]; then
+        echo "WARNING: GPU $1 has no PCI mapping; GEAK_GPU_REQUIRE_IDLE=0, so locking it by id only." >&2
+        echo "${LOCK_DIR}/gpu_unmapped_${1}.lock"
+    else
+        echo "ERROR: cannot resolve GPU $1 to a PCI address for its lock (see above); refusing to run." >&2
+        return 1
+    fi
+}
+
 _unknown_idle_error() {
     echo "ERROR: cannot verify that GPU $1 is idle (see above); refusing to run on it." >&2
     echo "       Fix the device mapping, or set GEAK_GPU_REQUIRE_IDLE=0 only for deliberately co-tenanted runs." >&2
@@ -178,7 +196,8 @@ case "$GPU_SPEC" in
     while [ -z "$GPU_ID" ]; do
         for _g in $POOL; do
             # (1) flock: exclusive lane. Held until this process exits.
-            exec {_fd}>"${LOCK_DIR}/gpu_${_g}.lock"
+            _lock_file="$(_gpu_lock_file "$_g")" || exit 1
+            exec {_fd}>"$_lock_file"
             if flock -n -x "$_fd"; then
                 # We hold the lane. Only now check idleness -- checking before locking would race.
                 if [ "${GEAK_GPU_REQUIRE_IDLE:-1}" = "1" ]; then
@@ -219,7 +238,7 @@ case "$GPU_SPEC" in
     ;;
 esac
 
-LOCK_FILE="${LOCK_DIR}/gpu_${GPU_ID}.lock"
+LOCK_FILE="$(_gpu_lock_file "$GPU_ID")" || exit 1
 
 # (0) Reap ORPHANED hung rocm_agent_enumerator procs before running. aiter's import spawns one such
 # subprocess per Python process for gfx detection; under GPU/KFD contention they HANG instead of
