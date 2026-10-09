@@ -97,13 +97,71 @@ fi
 # process holds the GPU, i.e. it fails exactly when we need it. Set GEAK_GPU_REQUIRE_IDLE=0 to skip
 # (e.g. deliberately co-tenanted screening runs). The default is 1 on BOTH paths: pool mode steps to
 # another GPU when one is busy, single-GPU mode has nowhere to step and so fails loudly instead.
+#
+# The GPU id is mapped to its sysfs device through KFD topology, not render-minor arithmetic:
+# render minors are consecutive on some hosts (MI210: renderD128..135) and spaced by eight on
+# others, so `128 + 8 * id` silently probed nonexistent nodes. ROCr enumerates GPU agents in KFD
+# node order (nodes with simd_count > 0), so physical index N is the N-th such node, and GPU_ID is
+# logical within an inherited numeric ROCR_VISIBLE_DEVICES mask. Each node's location_id/domain
+# must match the PCI address of its render node. GEAK_SYSFS_ROOT exists only for tests.
+GEAK_SYSFS_ROOT="${GEAK_SYSFS_ROOT:-/sys}"
+_gpu_sysfs_dev() {
+    local id="$1" phys i=0 entry node props minor loc dom dev want
+    case "$id" in ''|*[!0-9]*) echo "GPU id '$id' is not a non-negative integer" >&2; return 1 ;; esac
+    phys="$id"
+    if [ -n "${ROCR_VISIBLE_DEVICES:-}" ]; then
+        phys=""
+        for entry in $(echo "$ROCR_VISIBLE_DEVICES" | tr ',' ' '); do
+            case "$entry" in ''|*[!0-9]*)
+                echo "ROCR_VISIBLE_DEVICES entry '$entry' is not a numeric index; cannot map GPU $id to sysfs" >&2
+                return 1 ;;
+            esac
+            [ "$i" = "$id" ] && phys="$entry"
+            i=$((i + 1))
+        done
+        [ -n "$phys" ] || { echo "GPU $id is outside ROCR_VISIBLE_DEVICES=$ROCR_VISIBLE_DEVICES" >&2; return 1; }
+    fi
+    i=0
+    for node in $(ls "$GEAK_SYSFS_ROOT/class/kfd/kfd/topology/nodes" 2>/dev/null | sort -n); do
+        props="$GEAK_SYSFS_ROOT/class/kfd/kfd/topology/nodes/$node/properties"
+        [ "$(awk '$1=="simd_count"{print $2}' "$props" 2>/dev/null)" -gt 0 ] 2>/dev/null || continue
+        if [ "$i" = "$phys" ]; then
+            minor="$(awk '$1=="drm_render_minor"{print $2}' "$props")"
+            loc="$(awk '$1=="location_id"{print $2}' "$props")"
+            dom="$(awk '$1=="domain"{print $2}' "$props")"
+            case "$minor$loc${dom:-0}" in ''|*[!0-9]*)
+                echo "KFD node $node has no numeric render minor/location" >&2; return 1 ;;
+            esac
+            dev="$(readlink -f "$GEAK_SYSFS_ROOT/class/drm/renderD${minor}/device" 2>/dev/null)" || dev=""
+            want="$(printf '%04x:%02x:%02x.%x' "${dom:-0}" $(( (loc >> 8) & 255 )) $(( (loc >> 3) & 31 )) $(( loc & 7 )))"
+            if [ -z "$dev" ] || [ "${dev##*/}" != "$want" ]; then
+                echo "KFD node $node (PCI $want) does not match renderD${minor} (${dev:-missing})" >&2
+                return 1
+            fi
+            echo "$dev"
+            return 0
+        fi
+        i=$((i + 1))
+    done
+    echo "GPU $id (physical index $phys) has no KFD GPU node under $GEAK_SYSFS_ROOT" >&2
+    return 1
+}
+
+# Returns 0 idle, 1 busy, 2 unknown. Unknown (unmappable id, unreadable telemetry) is never idle:
+# callers fail loudly rather than measure on a GPU they could not inspect.
 _gpu_is_idle() {
     local id="$1" dev busy vram
-    dev="$(readlink -f "/sys/class/drm/renderD$((128 + 8 * id))/device" 2>/dev/null)" || return 0
-    [ -r "$dev/gpu_busy_percent" ] || return 0   # cannot tell -> do not block the run
-    busy="$(cat "$dev/gpu_busy_percent" 2>/dev/null || echo 0)"
-    vram="$(( $(cat "$dev/mem_info_vram_used" 2>/dev/null || echo 0) / 1048576 ))"
-    [ "${busy:-0}" -le "${GEAK_GPU_MAX_BUSY_PCT:-5}" ] && [ "$vram" -le "${GEAK_GPU_MAX_VRAM_MB:-1024}" ]
+    dev="$(_gpu_sysfs_dev "$id")" || return 2
+    busy="$(cat "$dev/gpu_busy_percent" 2>/dev/null)" || { echo "GPU $id: $dev/gpu_busy_percent unreadable" >&2; return 2; }
+    vram="$(cat "$dev/mem_info_vram_used" 2>/dev/null)" || { echo "GPU $id: $dev/mem_info_vram_used unreadable" >&2; return 2; }
+    case "$busy" in ''|*[!0-9]*) echo "GPU $id: non-numeric gpu_busy_percent '$busy'" >&2; return 2 ;; esac
+    case "$vram" in ''|*[!0-9]*) echo "GPU $id: non-numeric mem_info_vram_used '$vram'" >&2; return 2 ;; esac
+    [ "$busy" -le "${GEAK_GPU_MAX_BUSY_PCT:-5}" ] && [ "$(( vram / 1048576 ))" -le "${GEAK_GPU_MAX_VRAM_MB:-1024}" ]
+}
+
+_unknown_idle_error() {
+    echo "ERROR: cannot verify that GPU $1 is idle (see above); refusing to run on it." >&2
+    echo "       Fix the device mapping, or set GEAK_GPU_REQUIRE_IDLE=0 only for deliberately co-tenanted runs." >&2
 }
 
 case "$GPU_SPEC" in
@@ -123,9 +181,13 @@ case "$GPU_SPEC" in
             exec {_fd}>"${LOCK_DIR}/gpu_${_g}.lock"
             if flock -n -x "$_fd"; then
                 # We hold the lane. Only now check idleness -- checking before locking would race.
-                if [ "${GEAK_GPU_REQUIRE_IDLE:-1}" = "1" ] && ! _gpu_is_idle "$_g"; then
-                    flock -u "$_fd"; exec {_fd}>&-   # foreign job on this GPU: try the next lane
-                    continue
+                if [ "${GEAK_GPU_REQUIRE_IDLE:-1}" = "1" ]; then
+                    _idle_rc=0; _gpu_is_idle "$_g" || _idle_rc=$?
+                    [ "$_idle_rc" = 2 ] && { _unknown_idle_error "$_g"; exit 1; }
+                    if [ "$_idle_rc" != 0 ]; then
+                        flock -u "$_fd"; exec {_fd}>&-   # foreign job on this GPU: try the next lane
+                        continue
+                    fi
                 fi
                 GPU_ID="$_g"; POOL_FD="$_fd"
                 # Record which GPU of the pool was actually taken. Without this a pool acquisition
@@ -164,8 +226,11 @@ LOCK_FILE="${LOCK_DIR}/gpu_${GPU_ID}.lock"
 # exiting (<1s normally). With many parallel kernel jobs they pile up by the hundreds -> kernel
 # task-count explosion -> whole-box hang (observed: 561 enumerators / 37k tasks on a swap=0 box).
 # We kill ONLY ppid==1 (parent already dead) AND >60s old -> a live, in-use enumerator is never
-# touched. Best-effort; must never fail the wrapper (set -e). Opt out with KERNEL_ENV_SKIP_ENUM_REAP=1.
-if [ "${KERNEL_ENV_SKIP_ENUM_REAP:-0}" != "1" ]; then
+# touched. Best-effort; must never fail the wrapper (set -e).
+# OPT-IN (KERNEL_ENV_SKIP_ENUM_REAP=0): pgrep matches every enumerator on the host, and on a node
+# shared with other jobs -- possibly under the same uid -- an orphan here is not proof that this
+# run spawned it. GPU_ARCHS pinning in (3) already removes the spawn storm at its source.
+if [ "${KERNEL_ENV_SKIP_ENUM_REAP:-1}" != "1" ]; then
     for _p in $(pgrep -f rocm_agent_enumerator 2>/dev/null || true); do
         _pp="$(ps -o ppid= -p "$_p" 2>/dev/null | tr -d ' ' || true)"
         _et="$(ps -o etimes= -p "$_p" 2>/dev/null | tr -d ' ' || true)"
@@ -241,9 +306,13 @@ else
         # was that a single GPU has no alternative to step to, which is true -- but it argues for a
         # loud failure, not for measuring on a contaminated card. Set GEAK_GPU_REQUIRE_IDLE=0 to
         # restore the old behavior for deliberately co-tenanted runs.
-        if [ "${GEAK_GPU_REQUIRE_IDLE:-1}" = "1" ] && ! _gpu_is_idle "$GPU_ID"; then
-            echo "ERROR: GPU $GPU_ID has foreign work running (busy/VRAM above threshold); refusing to measure on it" >&2
-            exit 1
+        if [ "${GEAK_GPU_REQUIRE_IDLE:-1}" = "1" ]; then
+            _idle_rc=0; _gpu_is_idle "$GPU_ID" || _idle_rc=$?
+            [ "$_idle_rc" = 2 ] && { _unknown_idle_error "$GPU_ID"; exit 1; }
+            if [ "$_idle_rc" != 0 ]; then
+                echo "ERROR: GPU $GPU_ID has foreign work running (busy/VRAM above threshold); refusing to measure on it" >&2
+                exit 1
+            fi
         fi
         [ -n "${GEAK_GPU_USE_LOG:-}" ] && \
             echo "{\"t\":$(date +%s),\"gpu\":$GPU_ID,\"pool\":\"$GPU_SPEC\",\"pid\":$$,\"mode\":\"pin\",\"wait_s\":$(( SECONDS - _wait_t0 ))}" \
